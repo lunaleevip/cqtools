@@ -70,6 +70,16 @@ class StackDecompiler:
         # lines to drop in _filter_output().
         self._prologue_drop = 0
         self._real_seen = False
+        # Track array/object build contexts for NEWINIT/NEWARRAY → ENDINIT
+        self._init_stack = []  # list of (type, stack_pos, data)
+        # Pending method name from metadata block (XMLCOMMENT atom).
+        # Consumed by the next CALL instruction.
+        self._pending_method = None
+        # Root namespace (e.g. "xs.Tools.Net") propagated from the top-level
+        # script. Used by CALL/FUNAPPLY to reconstruct method names when the
+        # function value is lost from the stack. Never used by INITPROP/SETPROP
+        # fallback (those use _scope_or_namespace → namespace or "this").
+        self.root_ns = namespace
 
     def atom(self, idx):
         # read_atom_idx() already OR'd index_base in; do NOT OR again here.
@@ -169,6 +179,7 @@ class StackDecompiler:
     def emit(self, line):
         text = "    " * self.indent + line
         self.output.append(text)
+
         # "Substantive" = real assignment / call / property write / return /
         # control-flow / with-block. Once we see one, stop counting prologue.
         if not self._real_seen:
@@ -202,6 +213,9 @@ class StackDecompiler:
                         real = True
             elif s.startswith(("this.", "xs.", "var ", "if (", "with (", "try {")):
                 real = True
+            elif _re.match(r'^[\w.]+\(.*\);\s*$', s):
+                # Function/method call statement: cc.log(...), require(...), etc.
+                real = True
             elif s.startswith("throw "):
                 rhs = s[len("throw "):].rstrip(";").strip()
                 if rhs != "undefined" and not self._undef_only_expr(rhs):
@@ -233,7 +247,7 @@ class StackDecompiler:
         return (self.bc[self.pc + 1] << 8) | self.bc[self.pc + 2]
 
     def read_i16(self):
-        """BE int16 for JOF_JUMP"""
+        """BE int16 (kept for non-JUMP opcodes; JOF_JUMP uses read_u8 in this dialect)"""
         return struct.unpack_from('>h', self.bc, self.pc + 1)[0]
 
     def read_i32(self):
@@ -242,10 +256,29 @@ class StackDecompiler:
         return struct.unpack_from('>i', self.bc, self.pc + 1)[0]
 
     def read_atom_idx(self):
-        """Cocos2d-x: index is byte[4] of 5-byte instruction (pc[1:4]=padding, pc[4]=idx)"""
+        """SM 1.8.5 JOF_ATOM: 3-byte BE atom index at bytes pc+2,pc+3,pc+4"""
         if self.pc + 5 > len(self.bc):
             return 0
-        return self.bc[self.pc + 4] | self.index_base
+        return (self.bc[self.pc + 2] << 16) | (self.bc[self.pc + 3] << 8) | self.bc[self.pc + 4]
+
+    def _read_jump_offset(self):
+        """Read jump offset for IFEQ/IFNE with variable format.
+
+        Cocos2d-x SM 1.8.5 uses:
+        - JOF_JUMP (2 bytes, int8) for short jumps
+        - JOF_JUMPX (5 bytes, big-endian int32) for long jumps
+
+        Heuristic: try int8 first. Fall back to int32 if target is self-loop,
+        adjacent byte, or out of range. Returns (offset, instruction_size).
+        """
+        offset_s8 = struct.unpack_from('<b', self.bc, self.pc + 1)[0]
+        target_s8 = self.pc + offset_s8
+        if 0 <= target_s8 < len(self.bc) and abs(offset_s8) > 1:
+            return offset_s8, 2
+        if self.pc + 5 <= len(self.bc):
+            offset_s32 = struct.unpack_from('>i', self.bc, self.pc + 1)[0]
+            return offset_s32, 5
+        return offset_s8, 2
 
     def read_obj_idx(self):
         """Object index for LAMBDA/DEFFUN - raw byte without INDEXBASE."""
@@ -310,6 +343,34 @@ class StackDecompiler:
         # dead-code (cocos2d-x doesn't `delete localVar`). Keep `delete obj.X`
         # and `delete obj[K]` since those are real assertions.
         DELETE_BARE = re.compile(r"^delete\s+\w+;\s*$")
+        # `delete i[X]` / `delete local_N[X]` where the target is a simple
+        # loop variable — dead-code artifacts from stack underflow when
+        # DELELEM encounters loop-counter identifiers.
+        DELETE_LOOP = re.compile(r"^delete\s+([a-z_]\w*)\[.+\];\s*$")
+        # `delete literal.prop` / `delete ns[literal]` / `delete ns.ns` —
+        # stack-tracking artifacts where DELELEM operates on literals or
+        # namespace roots (xs, cc) instead of real objects.
+        DELETE_LITERAL = re.compile(
+            r"^delete\s+(true|false|null|undefined|this|arguments)\b"
+        )
+        DELETE_NEG = re.compile(r"^delete\s+-")
+        # `delete xs.xs` (self-referencing prop) / `delete xs[true]` / etc.
+        DELETE_NS_GARBAGE = re.compile(
+            r"^delete\s+(xs|cc)\b"
+        )
+        # `delete obj.prop[literal]` / `delete obj[literal]`
+        DELETE_LITERAL_IDX = re.compile(
+            r"^delete\s+.+\[(true|false|null|undefined|this)\];\s*$"
+        )
+        # `delete []...` / `delete ++/--` / `delete http://` — completely
+        # bogus stack-tracking artifacts.
+        DELETE_BOGUS_TGT = re.compile(
+            r"^delete\s+(\[|\(|\+\+|--|\"|\'|http)"
+        )
+        # `delete this[literal]` / `delete this[this]` / `delete obj[undefined]`
+        DELETE_THIS_LITERAL = re.compile(
+            r"^delete\s+this\[(true|false|null|undefined|this)\];\s*$"
+        )
         # `throw <bare>;` with a simple literal/identifier RHS is a stack-
         # tracker artifact (real `throw` uses an Error or string expression).
         THROW_BARE = re.compile(
@@ -346,6 +407,8 @@ class StackDecompiler:
         # Excludes assignments (single `=` that is not part of `===`/`!==`/
         # `<=`/`>=`).
         BARE_PAREN_EXPR = re.compile(r"^\(.*\);\s*$")
+        # `if (!this) { /* spin */ }` — SM compiler artifact (this is never null)
+        IF_NOT_THIS_SPIN = re.compile(r"^if\s*\(!this\)\s*\{\s*/\*\s*spin\s*\*/\s*\}$")
         def _is_assignment(s):
             # detect `=` that is not preceded/followed by another `=` or `!`/<>
             return bool(re.search(r"(?<![=!<>])=(?!=)", s))
@@ -388,6 +451,23 @@ class StackDecompiler:
                 continue
             if DELETE_BARE.match(stripped):
                 continue
+            if DELETE_LITERAL.match(stripped):
+                continue
+            if DELETE_NEG.match(stripped):
+                continue
+            if DELETE_NS_GARBAGE.match(stripped):
+                continue
+            if DELETE_LITERAL_IDX.match(stripped):
+                continue
+            if DELETE_BOGUS_TGT.match(stripped):
+                continue
+            if DELETE_THIS_LITERAL.match(stripped):
+                continue
+            m_del_loop = DELETE_LOOP.match(stripped)
+            if m_del_loop:
+                target = m_del_loop.group(1)
+                if re.match(r'^(local_\d+|arg_\d+|[a-z]{1,2}|xs|cc)$', target):
+                    continue
             if THROW_BARE.match(stripped):
                 continue
             if THIS_SET_NOISE.match(stripped):
@@ -421,6 +501,8 @@ class StackDecompiler:
                         and not re.search(r"[A-Za-z_]\w*\s*\(", inner)):
                     continue
             if DEAD_EXPR_RE.search(line):
+                continue
+            if IF_NOT_THIS_SPIN.match(stripped):
                 continue
             stripped = line.strip()
             # Skip lines with impossibly large arg/local indices
@@ -466,6 +548,29 @@ class StackDecompiler:
             cleaned = line.strip()
             if cleaned in ('this;', 'this);', 'undefined;'):
                 continue
+            # Clean embedded garbage in nested function bodies (lines
+            # containing newlines from _decompile_nested output).
+            if '\n' in line:
+                # Match delete-garbage patterns anywhere within the embedded
+                # string. Use MULTILINE so ^/$ anchor at each sub-line.
+                line = re.sub(
+                    r'^\s*delete\s+(true|false|null|undefined|this|arguments)\b[^;]*;\s*$',
+                    '', line, flags=re.MULTILINE
+                )
+                line = re.sub(
+                    r'^\s*delete\s+(\[|\(|\+\+|--|http)\b.*$',
+                    '', line, flags=re.MULTILINE
+                )
+                line = re.sub(
+                    r'^\s*delete\s+xs\b[^;]*;\s*$',
+                    '', line, flags=re.MULTILINE
+                )
+                line = re.sub(
+                    r'^\s*delete\s+cc\b[^;]*;\s*$',
+                    '', line, flags=re.MULTILINE
+                )
+                line = re.sub(r'\n\s*\n\s*\n', '\n\n', line)
+                line = re.sub(r'\n\s*\n', '\n', line)
             filtered.append(line)
         # Drop `local_N = X;` immediately overwritten by `local_N = ...;`
         # (SM emits a zero-init then real assignment in the same flow). Apply
@@ -479,15 +584,28 @@ class StackDecompiler:
             r"(false|true|null|0|1|undefined|this|arguments|"
             r"arg_\d+|local_\d+);\s*$"
         )
+        # `xs.A.B = undefined;` immediately before `xs.A.B.C = ...;`
+        # or `xs.A.B = undefined;` with no next line → dead namespace reset.
+        XS_RESET = re.compile(
+            r"^xs\.[\w.]+\.\w+\s*=\s*undefined;\s*$"
+        )
         dedup = []
         i = 0
         while i < len(filtered):
             cs = filtered[i].strip()
             ns = filtered[i + 1].strip() if i + 1 < len(filtered) else None
+            # local_N = X; next is local_N = ...; → drop first
             m1 = init_overwrite.match(cs)
             if m1 and ns is not None:
                 m2 = re.match(r"^(local_\d+)\s*=\s*", ns)
                 if m2 and m1.group(1) == m2.group(1):
+                    i += 1
+                    continue
+            # xs.A.B = undefined; followed by xs.A.B.C = ... → drop
+            if XS_RESET.match(cs) and ns is not None:
+                # The ns starts with the same prefix (without = undefined)
+                prefix = cs.split(" = ")[0]
+                if ns.startswith(prefix + "."):
                     i += 1
                     continue
             dedup.append(filtered[i])
@@ -644,6 +762,22 @@ class StackDecompiler:
         is_root = self.namespace is not None
         best_off = 0
         best_run = 0
+        # Pre-compute run length at offset 0. If it produces >= N valid
+        # opcodes, trust offset 0 as correct — no other offset can beat it
+        # even if metadata blocks inflate their opcode count.
+        pc0_run = 0
+        pc = 0
+        while pc < len(bc):
+            op = bc[pc]
+            if op > 255: break
+            sz = self._opcode_size(op)
+            if sz <= 0 or pc + sz > len(bc): break
+            pc0_run += 1
+            pc += sz
+            if pc0_run > 40:
+                break
+        prefer_zero = pc0_run >= 8
+
         for off in range(scan_limit):
             pc = off
             run = 0
@@ -662,10 +796,15 @@ class StackDecompiler:
                         break
                 run += 1
                 pc += sz
-                if run > best_run:
-                    best_run = run
+                # Near-tie: if offset 0 already has >= 8 valid opcodes and
+                # another offset's run is close (±1), prefer offset 0.
+                # This prevents metadata-interleaved bytecode (like AppAwake)
+                # from selecting a mid-stream offset that skips real code.
+                effective = run + (5 if off == 0 else 0)
+                if effective > best_run:
+                    best_run = effective
                     best_off = off
-                if run > 40:
+                if run > 40 or (prefer_zero and run > 30 and off > 0):
                     break  # Good enough, stop scanning
             if best_run > 40:
                 break
@@ -677,6 +816,10 @@ class StackDecompiler:
         This is embedded metadata, never executed at runtime."""
         pc = self.pc
         bc = self.bc
+        # Skip leading NOPs before checking for DUP (e.g. AppAwake.jsc starts
+        # with `00 35 00 00 00 01 ...` where the NOP precedes a DUP+XMLCOMMENT).
+        while pc < len(bc) and bc[pc] == 0:
+            pc += 1
         if pc >= len(bc) or bc[pc] != 12: return False  # DUP
         pc += 1
         while pc < len(bc) and bc[pc] == 0: pc += 1
@@ -692,11 +835,51 @@ class StackDecompiler:
             b = bc[pc]
             if b == 0: pc += 1; continue
             if b == 2: pc += 1; popv_count += 1; continue
-            if b == 228: pc += 3; continue  # OBJTOP
+            if b in (226, 227, 228): pc += 1; continue  # CX 1-byte markers
             if b == 1: pc += 1; continue  # PUSH
             if b == 61: pc += 5; continue  # STRING
             break
         self.pc = pc
+        return True
+
+    def _try_skip_metadata(self):
+        """Peek ahead: if pc points to DUP+XMLCOMMENT+FORARG metadata block,
+        skip the entire block and store the method name for the next CALL.
+
+        Cocos2d-x inserts debug metadata blocks throughout the bytecode:
+          DUP XMLCOMMENT(atom) FORARG(e4)
+
+        The XMLCOMMENT atom is the method name for the following CALL
+        instruction. We store it so CALL can emit `obj.method(args)`
+        instead of `this.call(obj, args)`.
+        """
+        pc = self.pc
+        bc = self.bc
+        if pc + 8 > len(bc):
+            return False
+        if bc[pc] != 12:  # DUP
+            return False
+        # Find XMLCOMMENT (184/0xb8) after DUP
+        peek = pc + 1
+        while peek < len(bc) and bc[peek] == 0:
+            peek += 1
+        if peek >= len(bc) or bc[peek] != 184:
+            return False
+        # Extract method name from XMLCOMMENT atom
+        xml_pos = peek
+        if xml_pos + 5 <= len(bc):
+            atom_idx = (bc[xml_pos + 2] << 16) | (bc[xml_pos + 3] << 8) | bc[xml_pos + 4]
+            if 0 <= atom_idx < len(self.atoms):
+                self._pending_method = self.atoms[atom_idx]
+        pos = xml_pos + 5  # Skip XMLCOMMENT (5 bytes)
+        if pos + 2 > len(bc):
+            return False
+        if bc[pos] != 10:  # FORARG
+            return False
+        if pos + 1 < len(bc) and bc[pos + 1] != 0xe4:
+            return False
+        pos += 2  # Skip FORARG (2 bytes: op + uint8 e4 marker)
+        self.pc = pos
         return True
 
     def _exec(self, op):
@@ -749,6 +932,12 @@ class StackDecompiler:
                 bogus = True
             if obj.endswith(("++", "--")):
                 bogus = True
+            if obj.startswith("function"):
+                bogus = True
+            if obj in ("true", "false", "null", "undefined"):
+                bogus = True
+            if obj.lstrip("-").isdigit():
+                bogus = True
             if popped_empty:
                 bogus = True
             if obj == "this":
@@ -785,22 +974,21 @@ class StackDecompiler:
             if val != "undefined":
                 self.emit(f"return {val};")
             self.pc += 1
-        # GOTO (JOF_JUMP, 3 bytes)
+        # GOTO (JOF_JUMPX, 5 bytes: opcode + int32 offset in Cocos2d-x dialect)
         elif op == 6:
-            offset = self.read_i16()
+            offset = self.read_i32()
             target = pc + offset
             self.jump_targets.add(target)
-            self.pc += 3
-        # IFEQ (JOF_JUMP). Strip outer paren in cond; skip emit for synthetic
-        # conds (`undefined`, function literals, etc.) that come from v9
-        # stack underflow rather than a real branch.
+            self.pc += 5
+        # IFEQ (variable: JOF_JUMP int8 or JOF_JUMPX int32 BE).
         elif op == 7:
-            offset = self.read_i16()
+            offset, jump_size = self._read_jump_offset()
             target = pc + offset
+            cond = self.pop()
             if target > pc:
-                cond = self.pop()
-                if cond in ("undefined", "true", "false", "null", "0", "1",
-                            "this", "arguments") or cond.startswith("function("):
+                if (cond in ("undefined", "true", "false", "null", "0", "1",
+                             "this", "arguments") or cond.startswith("function(")
+                        or cond.startswith('"')):
                     pass
                 else:
                     if cond.startswith("(") and cond.endswith(")"):
@@ -822,19 +1010,26 @@ class StackDecompiler:
                     self.jump_targets.add(target)
                     if pc < target <= len(self.bc):
                         self.pending_close[target] = self.pending_close.get(target, 0) + 1
-            self.pc += 3
-        # IFNE (JOF_JUMP).
+            elif target < pc:
+                if cond not in ("undefined", "true", "false", "null", "0", "1",
+                                "this", "arguments", "!this") and not cond.startswith("function(") and not cond.startswith('"'):
+                    self.emit(f"if ({cond}) {{ /* spin */ }}")
+            else:
+                if cond not in ("undefined", "true", "false", "null", "0", "1",
+                                "this", "arguments", "!this") and not cond.startswith("function(") and not cond.startswith('"'):
+                    self.emit(f"if ({cond}) {{ /* spin */ }}")
+            self.pc += jump_size
+        # IFNE (variable: JOF_JUMP int8 or JOF_JUMPX int32 BE).
         elif op == 8:
-            offset = self.read_i16()
+            offset, jump_size = self._read_jump_offset()
             target = pc + offset
+            cond = self.pop()
             if target > pc:
-                cond = self.pop()
-                if cond in ("undefined", "true", "false", "null", "0", "1",
-                            "this", "arguments") or cond.startswith("function("):
+                if (cond in ("undefined", "true", "false", "null", "0", "1",
+                             "this", "arguments", "!this")
+                        or cond.startswith("function(") or cond.startswith('"')):
                     pass
                 else:
-                    # Drop inner parens around a simple identifier / member
-                    # access to avoid `if (!(true))` style noise.
                     if re.match(r"^[\w\.]+$", cond) or re.match(r"^[\w\.]+\[\w+\]$", cond):
                         self.emit(f"if (!{cond}) {{")
                     else:
@@ -843,7 +1038,7 @@ class StackDecompiler:
                     if pc < target <= len(self.bc):
                         self.pending_close[target] = self.pending_close.get(target, 0) + 1
                     self.jump_targets.add(target)
-            self.pc += 3
+            self.pc += jump_size
         # ARGUMENTS
         elif op == 9:
             self.push("arguments")
@@ -853,7 +1048,10 @@ class StackDecompiler:
             val = self.pop()
             idx = self.read_u16()
             if idx >= max(self.nargs, 32):
-                self.push("undefined")
+                # Out of range — silently consume (metadata blocks use OOB
+                # indices as dead-code stores; pushing 'undefined' here
+                # pollutes the stack across XMLCOMMENT-interleaved blocks).
+                pass
             else:
                 self.emit(f"arg_{idx} = {val};")
                 self.push(f"arg_{idx}")
@@ -863,13 +1061,18 @@ class StackDecompiler:
             val = self.pop()
             idx = self.read_u16()
             if idx > 100:
-                self.push("undefined")
+                # Same OOB silent-consume as FORARG.
+                pass
             else:
                 self.emit(f"local_{idx} = {val};")
                 self.push(f"local_{idx}")
             self.pc += 3
-        # DUP
+        # DUP — may be start of a Cocos2d-x debug metadata block.
+        # Pattern: DUP XMLCOMMENT(atom) FORARG(e4, xx) [NOPs] [POPV/LEAVEWITH]
+        # These are compiler debug artifacts and should NOT affect the stack.
         elif op == 12:
+            if self._try_skip_metadata():
+                return
             self.push(self.peek())
             self.pc += 1
         # DUP2
@@ -945,6 +1148,42 @@ class StackDecompiler:
             self.emit(f"delete {obj}[{idx}];")
             self.push("true")
             self.pc += 1
+        # DECNAME (46, JOF_ATOM) — decrement named variable, push new value
+        elif op == 46:
+            name = self.atom(self.read_atom_idx())
+            self.emit(f"{name}--;")
+            self.push(name)
+            self.pc += 5
+        # NAMEINC (47, JOF_ATOM) — increment named variable, push new value
+        elif op == 47:
+            name = self.atom(self.read_atom_idx())
+            self.emit(f"{name}++;")
+            self.push(name)
+            self.pc += 5
+        # NAMEDEC (48, JOF_ATOM) — decrement named variable, push new value
+        elif op == 48:
+            name = self.atom(self.read_atom_idx())
+            self.emit(f"--{name};")
+            self.push(name)
+            self.pc += 5
+        # PROPINC (49, JOF_ATOM) — increment obj.prop, push new value
+        elif op == 49:
+            name = self.atom(self.read_atom_idx())
+            obj = self.pop() if self.stack else "undefined"
+            if obj == "undefined":
+                obj = self._scope_or_namespace() or "this"
+            self.emit(f"{obj}.{name}++;")
+            self.push(f"{obj}.{name}")
+            self.pc += 5
+        # PROPDEC (50, JOF_ATOM)
+        elif op == 50:
+            name = self.atom(self.read_atom_idx())
+            obj = self.pop() if self.stack else "undefined"
+            if obj == "undefined":
+                obj = self._scope_or_namespace() or "this"
+            self.emit(f"{obj}.{name}--;")
+            self.push(f"{obj}.{name}")
+            self.pc += 5
         # TYPEOF (39)
         elif op == 39:
             val = self.pop()
@@ -1032,6 +1271,12 @@ class StackDecompiler:
             self.pc += 5
         # SETPROP (54, JOF_ATOM). Push back a reference (`obj.name`) rather
         # than the full RHS so POP/POPV don't double-emit.
+        #
+        # Truthy placeholder fix: SM 1.8.5 often uses the namespace object
+        # as a cheap `true` for boolean config flags. Detect two patterns:
+        #   (1) val == "xs" (bare namespace)
+        #   (2) val == obj (self-reference: xs.A.B.C = xs.A.B.C;)
+        # In both cases the writer clearly intended `= true`.
         elif op == 54:
             val = self.pop()
             obj = self.pop()
@@ -1042,6 +1287,16 @@ class StackDecompiler:
             # in `.name` (SM dead-code namespace path artifact).
             if isinstance(obj, str) and obj.endswith("." + name):
                 obj = obj[: -(len(name) + 1)]
+            # Truthy placeholder: namespace-as-boolean.
+            # Only apply when:
+            #   (1) val is bare "xs" — always a truthy placeholder
+            #   (2) val == obj AND obj is a namespace path (starts with "xs.")
+            #       — NOT when obj is "arg_0", "this", etc. (those are real code)
+            if isinstance(val, str):
+                if val == "xs":
+                    val = "true"
+                elif val == obj and isinstance(obj, str) and obj.startswith("xs."):
+                    val = "true"
             self.emit(f"{obj}.{name} = {val};")
             self.push(f"{obj}.{name}")
             self.pc += 5
@@ -1049,6 +1304,8 @@ class StackDecompiler:
         elif op == 55:
             idx = self.pop()
             obj = self.pop()
+            if obj == "undefined":
+                obj = self._scope_or_namespace() or "this"
             self.push(f"{obj}[{idx}]")
             self.pc += 1
         # SETELEM (56)
@@ -1056,6 +1313,8 @@ class StackDecompiler:
             val = self.pop()
             idx = self.pop()
             obj = self.pop()
+            if obj == "undefined":
+                obj = self._scope_or_namespace() or "this"
             self.emit(f"{obj}[{idx}] = {val};")
             self.push(val)
             self.pc += 1
@@ -1075,10 +1334,39 @@ class StackDecompiler:
             args = [self.pop() for _ in range(argc)][::-1]
             this_val = self.pop()
             func = self.pop()
-            if func == "undefined" or self._looks_like_bogus_obj(func):
-                func = self._scope_or_namespace() or "this"
+            # If a metadata block preceded this CALL, the XMLCOMMENT atom
+            # provides the method name for the call target (this_val).
+            # The function on the stack (func) is often the namespace root
+            # (e.g. "xs") while this_val is the actual receiver object
+            # (e.g. "xs.JsbConnecter"). Construct `receiver.method(args)`.
+            used_metadata = False
+            if self._pending_method:
+                if this_val not in ("undefined", "this"):
+                    func = f"{this_val}.{self._pending_method}"
+                else:
+                    func = self._pending_method
+                self._pending_method = None
+                used_metadata = True
+            elif func in ("undefined", "this") or self._looks_like_bogus_obj(func):
+                last_arg = args[-1] if args else ""
+                # When the last argument is a quoted string that looks like
+                # a method name (camelCase), use root namespace to reconstruct
+                # the call: `xs.Tools.Net.requestLogin(mgr, url, cb, "requestLogin")`.
+                if (self.root_ns and isinstance(last_arg, str)
+                        and last_arg.startswith('"') and last_arg.endswith('"')
+                        and len(args) >= 3):
+                    inner = last_arg[1:-1]
+                    if re.match(r'^[a-z][a-zA-Z0-9_]*$', inner):
+                        func = f"{self.root_ns}.{inner}"
+                    else:
+                        func = self.root_ns
+                else:
+                    func = self.root_ns or self._scope_or_namespace() or "this"
             args_str = ", ".join(args)
-            if this_val in ("this", "undefined"):
+            if used_metadata:
+                # Metadata method call: emit `obj.method(args)` directly
+                self.push(f"{func}({args_str})")
+            elif this_val in ("this", "undefined"):
                 self.push(f"{func}({args_str})")
             else:
                 self.push(f"{func}.call({this_val}, {args_str})")
@@ -1105,9 +1393,9 @@ class StackDecompiler:
         elif op == 65: self.push("this"); self.pc += 1
         elif op == 66: self.push("false"); self.pc += 1
         elif op == 67: self.push("true"); self.pc += 1
-        # OR/AND (68,69 JOF_JUMP)
+        # OR/AND (68,69) — variable JOF_JUMP/JOF_JUMPX format.
         elif op in (68, 69):
-            self.pc += 3
+            self.pc += self._opcode_size(op)
         # TABLESWITCH/LOOKUPSWITCH (70,71,149,150)
         elif op in (70, 149):
             self._skip_tableswitch(op)
@@ -1121,33 +1409,14 @@ class StackDecompiler:
             self.pc += 1
         # XMLCOMMENT/XMLCDATA/XMLPI (183, 184, 185) — Cocos2d-x reuses these
         # opcodes for debug metadata. They sit after a DUP and precede a
-        # metadata block (FORARG / NOPs / POP). Empirically, treating them
-        # as GETPROP-like recovers a few extra emits but introduces more
-        # noise via root-script SETPROP chains. We keep the conservative
-        # skip-to-POP behaviour which has the best OK/empty balance.
+        # metadata block (FORARG / NOPs / POP). The real SM bytecode pushes
+        # the comment string; downstream FORARG stores it, then POPV discards
+        # the DUP-protected copy. We simulate this by pushing the atom as a
+        # string and advancing pc — the main loop handles FORARG/POPV/etc.
         elif op in (183, 184, 185):
-            if self.stack: self.pop()
-            pc = self.pc + 5  # skip the XMLCOMMENT op itself
-            bc = self.bc
-            while pc < len(bc) and bc[pc] == 0: pc += 1
-            if pc < len(bc) and bc[pc] == 10:  # FORARG (3 bytes)
-                pc += 3
-            while pc < len(bc):
-                b = bc[pc]
-                if b == 0: pc += 1; continue
-                if b in (2, 81):
-                    pc += 1
-                    break
-                if b == 228: pc += 3; continue
-                if b == 1: pc += 1; continue
-                if b == 61: pc += 5; continue
-                if b in (53, 54, 59, 156, 157, 187, 217): pc += 5; continue
-                if b == 12: pc += 1; continue
-                if b == 84: pc += 3; continue
-                if b == 27: pc += 1; continue
-                if b == 65: pc += 1; continue
-                break
-            self.pc = pc
+            name = self.atom(self.read_atom_idx())
+            self.push(f'"{name}"')
+            self.pc += 5
         # GETARG/SETARG (84,85)
         # Clamp to a sane range — large indices come from misread operand
         # bytes that aren't actually function arguments.
@@ -1253,17 +1522,30 @@ class StackDecompiler:
             self.emit(f"{name} = {val};")
             self.push(val)
             self.pc += 5
-        # CALLGNAME (217)
+        # CALLGNAME (217). When the stack already carries an object (e.g.
+        # "xs.appFiles"), treat this as property access rather than a
+        # standalone function-call setup — the cocos2d-x compiler uses
+        # CALLGNAME to push property references for comparison chains.
         elif op == 217:
             name = self.atom(self.read_atom_idx())
-            self.push(name)
-            self.push("this")
+            if self.stack and self.peek() not in ("undefined", "this", "arguments"):
+                obj = self.pop()
+                self.push(f"{obj}.{name}")
+            else:
+                self.push(name)
+                self.push("this")
             self.pc += 5
         # BINDGNAME (220)
         elif op == 220:
             name = self.atom(self.read_atom_idx())
             self.push(name)
             self.pc += 5
+        # Cocos2d-x markers: 0xe2 (5-byte call marker e2 00 00 00 09)
+        # and 0xe3 (1-byte NOP). Not DEFLOCALFUN_FC/LAMBDA_FC in this dialect.
+        elif op == 226:
+            self.pc += 5
+        elif op == 227:
+            self.pc += 1
         # LAMBDA/DEFFUN/DEFLOCALFUN (130,127,128,225-234)
         elif op in (130, 227, 234):  # LAMBDA, LAMBDA_FC, LAMBDA_DBGFC
             obj_idx = self.read_obj_idx()  # object index (no INDEXBASE)
@@ -1273,10 +1555,18 @@ class StackDecompiler:
         elif op in (127, 225, 232):  # DEFFUN, DEFFUN_FC, DEFFUN_DBGFC
             obj_idx = self.read_obj_idx()
             func_src = self._decompile_nested(obj_idx)
-            # Skip emit when the sub-script reduced to an empty stub —
-            # arbitrary `function() {}` lines look like syntax errors in JS.
-            if func_src and func_src.strip() not in ("function() {}", "function () {}"):
-                self.emit(func_src)
+            # Always emit the function definition, even if body is empty.
+            # SM pushes the function onto the stack at runtime — if we skip
+            # the emit AND don't push, downstream SETPROP/INITPROP that read
+            # this stack slot will pick up the wrong value.
+            if func_src:
+                stripped = func_src.strip()
+                if stripped not in ("function() {}", "function () {}"):
+                    self.emit(func_src)
+                # For JS readability, only push non-empty funcs as values.
+                # Empty funcs get pushed as 'undefined' placeholder — no
+                # real code assigns function(){} to a property.
+                self.push(stripped if stripped not in ("function() {}", "function () {}") else "undefined")
             self.pc += 5
         # DEFCONST (128, JOF_ATOM, 5 bytes) — `const NAME;` declaration. SM
         # leaves the value on the stack as the const initializer.
@@ -1333,10 +1623,22 @@ class StackDecompiler:
                     target = obj
             else:
                 target = self._scope_or_namespace() or "/* unknown */"
+            # Truthy placeholder: namespace-as-boolean (same as SETPROP)
+            if isinstance(val, str):
+                if val == "xs":
+                    val = "true"
+                elif val == target and isinstance(target, str) and target.startswith("xs."):
+                    val = "true"
             self.emit(f"{target}.{name} = {val};")
             self.pc += 5
-        # ENDINIT (92)
+        # ENDINIT (92) — finalizes NEWINIT (object) or NEWARRAY (array)
         elif op == 92:
+            if self._init_stack:
+                init_type, stack_pos, elements, length = self._init_stack.pop()
+                if init_type == "array":
+                    items = [elements.get(i, "undefined") for i in range(length)]
+                    if 0 <= stack_pos < len(self.stack):
+                        self.stack[stack_pos] = "[" + ", ".join(items) + "]"
             self.pc += 1
         # INITELEM (94)
         elif op == 94:
@@ -1394,8 +1696,24 @@ class StackDecompiler:
             args = [self.pop() for _ in range(argc)][::-1]
             this_val = self.pop()
             func = self.pop()
-            if func == "undefined":
-                func = self._scope_or_namespace() or "this"
+            if self._pending_method:
+                if this_val not in ("undefined", "this"):
+                    func = f"{this_val}.{self._pending_method}"
+                else:
+                    func = self._pending_method
+                self._pending_method = None
+            elif func in ("undefined", "this"):
+                last_arg = args[-1] if args else ""
+                if (self.root_ns and isinstance(last_arg, str)
+                        and last_arg.startswith('"') and last_arg.endswith('"')
+                        and len(args) >= 3):
+                    inner = last_arg[1:-1]
+                    if re.match(r'^[a-z][a-zA-Z0-9_]*$', inner):
+                        func = f"{self.root_ns}.{inner}"
+                    else:
+                        func = self.root_ns
+                else:
+                    func = self.root_ns or self._scope_or_namespace() or "this"
             self.push(f"{func}({', '.join(args)})")
             self.pc += 3
         # GETTHISPROP (211, JOF_ATOM)
@@ -1447,9 +1765,9 @@ class StackDecompiler:
         # DEBUGGER (115)
         elif op == 115:
             self.pc += 1
-        # GOSUB/GOSUBX (116, 146)
+        # GOSUB/GOSUBX (116 JOF_JUMP variable format, 146 JOF_JUMPX=5 bytes)
         elif op in (116, 146):
-            self.pc += 3 if op == 116 else 5
+            self.pc += self._opcode_size(op) if op == 116 else 5
         # INCARG/DECARG/ARGINC/ARGDEC (97-100). Plausible idx range is small;
         # giant indices indicate the bytes were operand bytes of a larger op
         # we misread, so push 'undefined' instead of polluting the stack.
@@ -1475,13 +1793,20 @@ class StackDecompiler:
         # IMACOP (105) - internal, skip
         elif op == 105:
             self.pc += 1
-        # USESHARP (96, JOF_UINT16PAIR = 5 bytes)
+        # USESHARP (96, JOF_UINT24 = 4 bytes in this dialect).
+        # In Cocos2d-x array literal compilation: NEWARRAY → STRING + USESHARP(i)×N → ENDINIT.
+        # USESHARP(idx) pops the element value and stores it at array position idx.
         elif op == 96:
-            self.push("undefined")
-            self.pc += 5
-        # DEFSHARP (95, JOF_UINT16PAIR = 5 bytes)
+            idx = (self.bc[self.pc + 1] << 16) | (self.bc[self.pc + 2] << 8) | self.bc[self.pc + 3]
+            val = self.pop() if self.stack else "undefined"
+            if self._init_stack:
+                init_type, _, elements, _ = self._init_stack[-1]
+                if init_type == "array":
+                    elements[idx] = val
+            self.pc += 4
+        # DEFSHARP (95, JOF_UINT24 = 4 bytes in this dialect)
         elif op == 95:
-            self.pc += 5
+            self.pc += 4
         # ENTERBLOCK (201, JOF_OBJECT = 5 bytes)
         elif op == 201:
             self.pc += 5
@@ -1602,7 +1927,9 @@ class StackDecompiler:
             self.pc += 5
         # NEWARRAY (90, JOF_UINT24 = 4 bytes)
         elif op == 90:
+            length = (self.bc[self.pc + 1] << 16) | (self.bc[self.pc + 2] << 8) | self.bc[self.pc + 3]
             self.push("[]")
+            self._init_stack.append(("array", len(self.stack) - 1, {}, length))
             self.pc += 4
         # NEWOBJECT (91, JOF_OBJECT = 5 bytes)
         elif op == 91:
@@ -1641,10 +1968,38 @@ class StackDecompiler:
             self.pc += self._opcode_size(op)
 
     def _opcode_size(self, op):
-        """Get instruction size from opcode table."""
+        """Get instruction size from opcode table.
+
+        Cocos2d-x SM 1.8.5 dialect fixes vs standard SM 1.8.5:
+        - JOF_JUMP: uint8 offset (2 bytes) instead of int16 (3 bytes)
+        - USESHARP/DEFSHARP (95,96): uint24 (4 bytes) instead of uint16pair (5 bytes)
+        """
         from decompile_to_js_v8 import OPCODE_ENTRIES, SM_FL as V8_FL
+        # Per-opcode overrides for dialect differences
+        if op == 226:
+            return 5  # 0xe2: 5-byte call marker (e2 00 00 00 09), NOT DEFLOCALFUN_FC
+        if op in (227, 228):
+            return 1  # 0xe3/e4: 1-byte markers in Cocos2d-x, NOT LAMBDA/OBJTOP
+        if op == 6:
+            return 5  # GOTO uses JOF_JUMPX (5 bytes) in Cocos2d-x dialect
+        if op in (95, 96):
+            return 4  # USESHARP/DEFSHARP: uint24 (4 bytes)
         for oc, name, fmt in OPCODE_ENTRIES:
             if oc == op:
+                if fmt == 'JOF_JUMP':
+                    # Variable format (JOF_JUMP int8 or JOF_JUMPX int32 BE).
+                    # Cocos2d-x compiler selects format based on jump distance.
+                    # Same heuristic as IFEQ/IFNE: try int8 first, fall back
+                    # to int32 BE if the target looks invalid.
+                    if self.pc + 2 > len(self.bc):
+                        return 1
+                    offset_s8 = struct.unpack_from('<b', self.bc, self.pc + 1)[0]
+                    target_s8 = self.pc + offset_s8
+                    if 0 <= target_s8 < len(self.bc) and abs(offset_s8) > 1:
+                        return 2
+                    if self.pc + 5 <= len(self.bc):
+                        return 5
+                    return 2
                 sz = V8_FL.get(fmt, 1)
                 return sz if sz > 0 else 1
         return 1
@@ -1710,6 +2065,7 @@ class StackDecompiler:
         if not nested_bc or len(nested_bc) < 2:
             return "function() {}"
         sub = StackDecompiler(nested_bc, nested_atoms, sub_scripts, nargs)
+        sub.root_ns = self.root_ns
         try:
             body = sub.decompile()
         except Exception:
@@ -1782,9 +2138,9 @@ def decompile_file(jsc_path):
 
 
 if __name__ == '__main__':
-    if len(sys.argv) < 2:
-        print("Usage: python decompile_jsc_v9.py <input.jsc>")
-        sys.exit(1)
+    # Windows GBK console can't encode Unicode output; force UTF-8.
+    if hasattr(sys.stdout, 'reconfigure'):
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
     path = sys.argv[1]
     result = decompile_file(path)
     if len(sys.argv) > 2:
